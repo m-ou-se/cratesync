@@ -1,17 +1,17 @@
-#![feature(exit_status_error)]
-#![feature(let_else)]
-#![feature(map_try_insert)]
-
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{
+        btree_map::Entry::{Occupied, Vacant},
+        BTreeMap, HashSet, VecDeque,
+    },
     env::set_current_dir,
-    fs::{create_dir_all, rename, File},
+    fs::{create_dir_all, read_dir, rename, File},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
+    net::ToSocketAddrs,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -96,21 +96,28 @@ fn download_crates(index: &Index, args: &Args) -> Result<()> {
     let n_threads = args.connections.min(n_todo);
     println!("Downloading the remaining {n_todo} using {n_threads} parallel connections...\n");
 
+    let host = "static.crates.io";
+    let sock_addrs = format!("{host}:443").to_socket_addrs()?.collect::<Vec<_>>();
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("cratesync")
+        .resolve_to_addrs(host, &sock_addrs)
+        .build()?;
+
     let queue = Mutex::new(queue);
     let errors = Mutex::new(Vec::new());
     let n_done = AtomicUsize::new(0);
     let bytes = AtomicU64::new(0);
     let start = Instant::now();
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("cratesync")
-        .build()?;
 
     thread::scope(|s| -> Result<()> {
         for _ in 0..n_threads {
             s.spawn(|| loop {
                 let item = queue.lock().unwrap().pop_front();
-                let Some((name, version, cksum)) = item else { break };
-                let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+                let Some((name, version, cksum)) = item else {
+                    break;
+                };
+                let url = format!("https://{host}/crates/{name}/{name}-{version}.crate");
                 let file = format!("crates/{name}/{name}-{version}.crate");
                 let partial_file = format!("{file}.partial");
                 if let Err(e) = || -> Result<()> {
@@ -181,6 +188,7 @@ struct Index {
 #[derive(Debug, Deserialize)]
 struct CrateData {
     cksum: String,
+    #[allow(unused)]
     yanked: bool,
 }
 
@@ -194,15 +202,13 @@ struct Metadata {
 
 impl Index {
     fn add_dir(&mut self, dir: impl AsRef<Path>) -> Result<()> {
-        for e in std::fs::read_dir(dir.as_ref())? {
+        for e in read_dir(dir.as_ref())? {
             let e = e?;
             let name = e.file_name();
             let name = name.to_str().context("invalid utf-8 file name in index")?;
-            if name.starts_with('.') {
-                // Ignore hidden directories like .git and .github.
-            } else if e.file_type()?.is_dir() {
+            if e.file_type()?.is_dir() {
                 self.add_dir(e.path())?;
-            } else if name != "config.json" {
+            } else {
                 let content = std::fs::read_to_string(e.path())
                     .with_context(|| format!("unable to read {:?}", e.path()))?;
                 let mut entry = BTreeMap::default();
@@ -220,9 +226,12 @@ impl Index {
                     entry.insert(metadata.vers, metadata.data);
                 }
                 if let Some(crate_name) = crate_name {
-                    self.crates
-                        .try_insert(crate_name, entry)
-                        .map_err(|e| anyhow!(e.to_string()))?;
+                    match self.crates.entry(crate_name) {
+                        Vacant(e) => {
+                            e.insert(entry);
+                        }
+                        Occupied(e) => bail!("duplicate entry for `{}`", e.key()),
+                    }
                 }
             }
         }
@@ -231,25 +240,10 @@ impl Index {
 
     fn update() -> Result<()> {
         if !Path::new("crates.io-index").exists() {
-            Command::new("git")
-                .args(["clone", "https://github.com/rust-lang/crates.io-index"])
-                .spawn()?
-                .wait()?
-                .exit_ok()?;
+            git(["clone", "https://github.com/rust-lang/crates.io-index"])?;
         }
-
-        Command::new("git")
-            .args(["-C", "crates.io-index", "fetch"])
-            .spawn()?
-            .wait()?
-            .exit_ok()?;
-
-        Command::new("git")
-            .args(["-C", "crates.io-index", "reset", "--hard", "origin/master"])
-            .spawn()?
-            .wait()?
-            .exit_ok()?;
-
+        git(["-C", "crates.io-index", "fetch"])?;
+        git(["-C", "crates.io-index", "reset", "--hard", "origin/master"])?;
         Ok(())
     }
 
@@ -258,8 +252,21 @@ impl Index {
             crates: BTreeMap::new(),
         };
 
-        index.add_dir("crates.io-index")?;
+        for e in read_dir("crates.io-index")? {
+            let e = e?;
+            if e.file_name().as_encoded_bytes().starts_with(b".") {
+                // Ignore hidden directories like .git and .github.
+            } else if e.file_type()?.is_dir() {
+                index.add_dir(e.path())?;
+            }
+        }
 
         Ok(index)
     }
+}
+
+fn git<const N: usize>(args: [&str; N]) -> Result<()> {
+    let status = Command::new("git").args(args).spawn()?.wait()?;
+    ensure!(status.success(), "git command failed");
+    Ok(())
 }
